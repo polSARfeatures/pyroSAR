@@ -820,3 +820,969 @@ def noise_power(infile, outdir, polarizations, spacing, t_srs, refarea='sigma0',
         if cleanup:
             if os.path.isdir(procdir):
                 shutil.rmtree(procdir, onerror=windows_fileprefix)
+
+
+
+
+
+
+def C2_geocode(infile, outdir, t_srs=4326, spacing=20, polarizations='all', shapefile=None,
+                       geocoding_type='Range-Doppler', removeS1ThermalNoise=True, offset=None, allow_RES_OSV=False,
+                       demName='Copernicus 30m Global DEM', externalDEMFile=None, externalDEMNoDataValue=None,
+                       externalDEMApplyEGM=True, basename_extensions=None,
+                       test=False, export_extra=None, groupsize=1, cleanup=True, tmpdir=None,
+                       gpt_exceptions=None, gpt_args=None, returnWF=False, nodataValueAtSea=False,
+                       demResamplingMethod='BILINEAR_INTERPOLATION', imgResamplingMethod='BILINEAR_INTERPOLATION',
+                       alignToStandardGrid=False, standardGridOriginX=0, standardGridOriginY=0,
+                       speckleFilter = True, clean_edges=False, clean_edges_npixels=1,
+                       rlks=None, azlks=None, multilook=False):
+    """
+    General function for handling Sentinel 1 SLC data and geocode its covariance matrix C2.
+    The thermal noise reduction is handled using the methodology explained in Thermal noise removal from polarimetric Sentinel-1 data;
+    by Mascolo et al. <https://ieeexplore.ieee.org/abstract/document/9330529>
+    
+    This function performs the following steps:
+    
+    - (if necessary) identify the SAR scene(s) passed via argument `infile` (:func:`pyroSAR.drivers.identify`)
+    - (if necessary) create the directories defined via `outdir` and `tmpdir`
+    - (if necessary) download Sentinel-1 OSV files
+    - parse a SNAP workflow (:class:`pyroSAR.snap.auxil.Workflow`)
+    - write the workflow to an XML file in `outdir`
+    - execute the workflow (:func:`pyroSAR.snap.auxil.gpt`)
+
+    Note
+    ----
+    The function may create workflows with multiple `Write` nodes. All nodes are parametrized to write data in ENVI format,
+    in which case the node parameter `file` is going to be a directory. All nodes will use the same temporary directory,
+    which will be created in `tmpdir`.
+    Its name is created from the basename of the `infile` (:meth:`pyroSAR.drivers.ID.outname_base`)
+    and a suffix identifying each processing node of the workflow (:meth:`pyroSAR.snap.auxil.Workflow.suffix`).
+    
+    For example: `S1A__IW___A_20180101T170648_NR_Orb_Cal_ML_TF_TC`.
+    
+    Parameters
+    ----------
+    infile: str or ~pyroSAR.drivers.ID or list
+        The SAR scene(s) to be processed; multiple scenes are treated as consecutive acquisitions, which will be
+        mosaicked with SNAP's SliceAssembly operator.
+    outdir: str
+        The directory to write the final files to.
+    t_srs: int or str or osgeo.osr.SpatialReference
+        A target geographic reference system in WKT, EPSG, PROJ4 or OPENGIS format.
+        See function :func:`spatialist.auxil.crsConvert()` for details.
+        Default: `4326 <https://spatialreference.org/ref/epsg/4326/>`_.
+    spacing: int or float, optional
+        The target pixel spacing in meters. Default is 20
+    polarizations: list[str] or str
+        The polarizations to be processed; can be a string for a single polarization, e.g. 'VV', or a list of several
+        polarizations, e.g. ['VV', 'VH']. With the special value 'all' (default) all available polarizations are
+        processed.
+    shapefile: str or :py:class:`~spatialist.vector.Vector` or dict, optional
+        A vector geometry for subsetting the SAR scene to a test site. Default is None.
+    geocoding_type: {'Range-Doppler', 'SAR simulation cross correlation'}, optional
+        The type of geocoding applied; can be either 'Range-Doppler' (default) or 'SAR simulation cross correlation'
+    removeS1ThermalNoise: bool, optional
+        Enables removal of S1 thermal noise (default).
+    offset: tuple, optional
+        A tuple defining offsets for left, right, top and bottom in pixels, e.g. (100, 100, 0, 0); this variable is
+        overridden if a shapefile is defined. Default is None.
+    allow_RES_OSV: bool
+        (only applies to Sentinel-1) Also allow the less accurate RES orbit files to be used?
+        The function first tries to download a POE file for the scene.
+        If this fails and RES files are allowed, it will download the RES file.
+        The selected OSV type is written to the workflow XML file.
+        Processing is aborted if the correction fails (Apply-Orbit-File parameter continueOnFail set to false).
+    demName: str
+        The name of the auto-download DEM. Default is 'SRTM 1Sec HGT'. Is ignored when `externalDEMFile` is not None.
+        Supported options:
+        
+         - ACE2_5Min
+         - ACE30
+         - ASTER 1sec GDEM
+         - CDEM
+         - Copernicus 30m Global DEM
+         - Copernicus 90m Global DEM
+         - GETASSE30
+         - SRTM 1Sec Grid
+         - SRTM 1Sec HGT
+         - SRTM 3Sec
+    externalDEMFile: str or None, optional
+        The absolute path to an external DEM file. Default is None. Overrides `demName`.
+    externalDEMNoDataValue: int, float or None, optional
+        The no data value of the external DEM. If not specified (default) the function will try to read it from the
+        specified external DEM.
+    externalDEMApplyEGM: bool, optional
+        Apply Earth Gravitational Model to external DEM? Default is True.
+    basename_extensions: list of str or None
+        Names of additional parameters to append to the basename, e.g. ['orbitNumber_rel'].
+    test: bool, optional
+        If set to True the workflow xml file is only written and not executed. Default is False.
+    export_extra: list or None
+        A list of image file IDs to be exported to outdir. The following IDs are currently supported:
+        
+         - incidenceAngleFromEllipsoid
+         - localIncidenceAngle
+         - projectedLocalIncidenceAngle
+         - DEM
+         - layoverShadowMask
+         - scatteringArea (requires ``terrainFlattening=True``)
+         - gammaSigmaRatio (requires ``terrainFlattening=True`` and ``refarea=['sigma0', 'gamma0']``)
+    groupsize: int
+        The number of workers executed together in one gpt call.
+    cleanup: bool
+        Should all files written to the temporary directory during function execution be deleted after processing?
+        Default is True.
+    tmpdir: str or None
+        Path of custom temporary directory, useful to separate output folder and temp folder. If `None`, the `outdir`
+        location will be used. The created subdirectory will be deleted after processing if ``cleanup=True``.
+    gpt_exceptions: dict or None
+        A dictionary to override the configured GPT executable for certain operators;
+        each (sub-)workflow containing this operator will be executed with the define executable;
+        
+         - e.g. ``{'Terrain-Flattening': '/home/user/snap/bin/gpt'}``
+    gpt_args: list or None
+        A list of additional arguments to be passed to the gpt call.
+        
+        - e.g. ``['-x', '-c', '2048M']`` for increased tile cache size and intermediate clearing
+    returnWF: bool
+        Return the full name of the written workflow XML file?
+    nodataValueAtSea: bool
+        Mask pixels acquired over sea? The sea mask depends on the selected DEM.
+    demResamplingMethod: str
+        One of the following:
+        
+         - 'NEAREST_NEIGHBOUR'
+         - 'BILINEAR_INTERPOLATION'
+         - 'CUBIC_CONVOLUTION'
+         - 'BISINC_5_POINT_INTERPOLATION'
+         - 'BISINC_11_POINT_INTERPOLATION'
+         - 'BISINC_21_POINT_INTERPOLATION'
+         - 'BICUBIC_INTERPOLATION'
+    imgResamplingMethod: str
+        The resampling method for geocoding the SAR image; the options are identical to demResamplingMethod.
+    alignToStandardGrid: bool
+        Align all processed images to a common grid?
+    standardGridOriginX: int or float
+        The x origin value for grid alignment
+    standardGridOriginY: int or float
+        The y origin value for grid alignment
+    speckleFilter: bool
+        Applies a Lee speckle filter if True.
+    clean_edges: bool
+        erode noisy image edges? See :func:`pyroSAR.snap.auxil.erode_edges`.
+        Does not apply to layover-shadow mask.
+    clean_edges_npixels: int
+        the number of pixels to erode.
+    rlks: int or None
+        the number of range looks. If not None, overrides the computation done by function
+        :func:`pyroSAR.ancillary.multilook_factors` based on the image pixel spacing and the target spacing.
+    azlks: int or None
+        the number of azimuth looks. Like `rlks`.
+    multilook : bool
+        If True, adds a multilook node to the processing graph.
+
+    Returns
+    -------
+    str or None
+        Either the name of the workflow file if ``returnWF == True`` or None otherwise
+    
+    .. figure:: figures/snap_geocode.svg
+        :align: center
+    """
+    
+    if clean_edges:
+        try:
+            import scipy
+        except ImportError:
+            raise RuntimeError('please install scipy to clean edges')
+    
+    if isinstance(infile, ID):
+        id = infile
+        ids = [id]
+    elif isinstance(infile, str):
+        id = identify(infile)
+        ids = [id]
+    elif isinstance(infile, list):
+        ids = identify_many(infile, sortkey='start')
+        id = ids[0]
+    else:
+        raise TypeError("'infile' must be of type str, list or pyroSAR.ID")
+    
+    if id.is_processed(outdir):
+        log.info('scene {} already processed'.format(id.outname_base()))
+        return
+    
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    ############################################
+    # general setup
+    process_S1_SLC = False
+    
+    if id.sensor in ['ASAR', 'ERS1', 'ERS2']:
+        formatName = 'ENVISAT'
+    elif id.sensor in ['S1A', 'S1B']:
+        if id.product == 'SLC':
+            process_S1_SLC = True
+        formatName = 'SENTINEL-1'
+    else:
+        raise RuntimeError('sensor not supported (yet)')
+    
+    # several options like resampling are modified globally for the whole workflow at the end of this function
+    # this list gathers IDs of nodes for which this should not be done because they are configured individually
+    resampling_exceptions = []
+    ######################
+    if isinstance(polarizations, str):
+        if polarizations == 'all':
+            polarizations = id.polarizations
+        else:
+            if polarizations in id.polarizations:
+                polarizations = [polarizations]
+            else:
+                raise RuntimeError('polarization {} does not exists in the source product'.format(polarizations))
+    elif isinstance(polarizations, list):
+        polarizations = [x for x in polarizations if x in id.polarizations]
+    else:
+        raise RuntimeError('polarizations must be of type str or list')
+    
+    swaths = None
+    if process_S1_SLC:
+        if id.acquisition_mode == 'IW':
+            swaths = ['IW1', 'IW2', 'IW3']
+        elif id.acquisition_mode == 'EW':
+            swaths = ['EW1', 'EW2', 'EW3', 'EW4', 'EW5']
+        elif re.search('S[1-6]', id.acquisition_mode):
+            pass
+        else:
+            raise RuntimeError('acquisition mode {} not supported'.format(id.acquisition_mode))
+    
+    bandnames = dict()
+    bandnames['beta0'] = ['Beta0_' + x for x in polarizations]
+    bandnames['gamma0'] = ['Gamma0_' + x for x in polarizations]
+    bandnames['sigma0'] = ['Sigma0_' + x for x in polarizations]
+    bandnames['int'] = ['Intensity_' + x for x in polarizations]
+    ############################################
+    ############################################
+    # parse base workflow
+    workflow = parse_recipe('blank')
+
+    ############################################
+    if not isinstance(infile, list):
+        infile = [infile]
+    
+    last = None
+    collect = []
+    for i in range(0, len(infile)):
+        ############################################
+        # Read node configuration
+        read = parse_node('Read')
+        workflow.insert_node(read)
+        read.parameters['file'] = ids[i].scene
+        read.parameters['formatName'] = formatName
+        last = read
+        ############################################
+        #Orbit file handling
+        orb = orb_parametrize(scene=ids[i], formatName=formatName, allow_RES_OSV=allow_RES_OSV)
+        workflow.insert_node(orb, before=last.id)
+        last = orb
+        collect.append(last.id)
+    ############################################
+    # SliceAssembly node configuration
+    if len(collect) > 1:
+        sliceAssembly = parse_node('SliceAssembly')
+        workflow.insert_node(sliceAssembly, before=collect)
+        sliceAssembly.parameters['selectedPolarisations'] = polarizations
+        last = sliceAssembly
+
+    ############################################
+    # Branch 1: Complex output calibration
+    # Calibration node configuration
+    calcomplex = parse_node('Calibration')
+    workflow.insert_node(calcomplex,before=last.id)
+    calcomplex.parameters['selectedPolarisations'] = polarizations
+    calcomplex.parameters['outputImageInComplex'] = True
+    calcomplex.parameters['outputSigmaBand'] = True
+    # TOPSAR-Deburst node configuration
+    if process_S1_SLC and swaths is not None:
+        debcomplex = parse_node('TOPSAR-Deburst')
+        workflow.insert_node(debcomplex, before=calcomplex.id)
+        debcomplex.parameters['selectedPolarisations'] = polarizations
+        
+    if id.sensor in ['S1A', 'S1B'] and removeS1ThermalNoise:
+        ############################################
+        #Branch 2: thermal noise removal and calibration
+        # Thermal noise removal node configuration
+        tn = parse_node('ThermalNoiseRemoval')
+        workflow.insert_node(tn, before= last.id)
+        tn.source=last.id
+        tn.parameters['selectedPolarisations'] = polarizations
+        #Calibration
+        cal = parse_node('Calibration')
+        workflow.insert_node(cal, before=tn.id)
+        cal.parameters['selectedPolarisations'] = polarizations
+        cal.parameters['outputSigmaBand'] = True
+        # TOPSAR-Deburst node configuration
+        if process_S1_SLC and swaths is not None:
+            deb = parse_node('TOPSAR-Deburst')
+            workflow.insert_node(deb, before=cal.id)
+            deb.parameters['selectedPolarisations'] = polarizations
+        #Put back the source for first calibration because it is overwritten
+        calcomplex.source=last.id
+
+        ############################################
+        # Band merge
+        bm = parse_node('BandMerge')
+        workflow.insert_node(bm,before=[debcomplex.id, deb.id])
+        last = bm
+    
+    ############################################
+    # Subset node configuration
+    if shapefile is not None or offset is not None:
+        sub = sub_parametrize(scene=id, geometry=shapefile, offset=offset, buffer=0.)
+        if removeS1ThermalNoise:
+            workflow.insert_node(sub, before=last.id)
+        else:
+            workflow.insert_node(sub, before=debcomplex.id)
+
+        last = sub
+    
+    if removeS1ThermalNoise:
+        # Band maths where the thermal noise reduction is applied
+        # Goes directly to the C2 elements
+        ############################################
+        # Band maths
+        bmath=parse_node('BandMaths')
+        workflow.insert_node(bmath)
+        bmath.source=last.id
+        bmath.element.attrib['class'] = '"com.bc.ceres.binding.dom.XppDomElement"'
+        bmath.parameters.clear_variables()
+        bmath.parameters['targetBands'][0]['name']='i_HH'
+        bmath.parameters['targetBands'][0]['expression']='sqrt(Sigma0_HH)*cos(atan2(q_HH,i_HH))'
+        bmath.parameters['targetBands'][0]['type']='float32'
+        bmath.parameters['targetBands'][0]['noDataValue']=0
+        ############################################
+        bmath2=parse_node('BandMaths')
+        workflow.insert_node(bmath2)
+        bmath2.source=last.id
+        bmath2.element.attrib['class'] = '"com.bc.ceres.binding.dom.XppDomElement"'
+        bmath2.parameters.clear_variables()
+        bmath2.parameters['targetBands'][0]['name']='q_HH'
+        bmath2.parameters['targetBands'][0]['expression']='sqrt(Sigma0_HH)*sin(atan2(q_HH,i_HH))'
+        bmath2.parameters['targetBands'][0]['type']='float32'
+        bmath2.parameters['targetBands'][0]['noDataValue']=0
+        ############################################
+        bmath3=parse_node('BandMaths')
+        workflow.insert_node(bmath3)
+        bmath3.source=last.id
+        bmath3.element.attrib['class'] = '"com.bc.ceres.binding.dom.XppDomElement"'
+        bmath3.parameters.clear_variables()
+        bmath3.parameters['targetBands'][0]['name']='i_HV'
+        bmath3.parameters['targetBands'][0]['expression']='sqrt(Sigma0_HV)*cos(atan2(q_HV,i_HV))'
+        bmath3.parameters['targetBands'][0]['type']='float32'
+        bmath3.parameters['targetBands'][0]['noDataValue']=0
+        ############################################
+        bmath4=parse_node('BandMaths')
+        workflow.insert_node(bmath4)
+        bmath4.source=last.id
+        bmath4.element.attrib['class'] = '"com.bc.ceres.binding.dom.XppDomElement"'
+        bmath4.parameters.clear_variables()
+        bmath4.parameters['targetBands'][0]['name']='q_HV'
+        bmath4.parameters['targetBands'][0]['expression']='sqrt(Sigma0_HV)*sin(atan2(q_HV,i_HV))'
+        bmath4.parameters['targetBands'][0]['type']='float32'
+        bmath4.parameters['targetBands'][0]['noDataValue']=0
+        ############################################
+        # Merge band math
+        mergemath = parse_node('BandMerge')
+        workflow.insert_node(mergemath,before=[bmath.id, bmath2.id, bmath3.id, bmath4.id])
+        last = mergemath
+        
+    ############################################
+    # Polarimetric matrices node configuration
+    poma = parse_node('Polarimetric-Matrices')
+    poma.parameters['matrix'] = 'C2'
+    workflow.insert_node(poma, before=last.id)
+    last = poma
+        
+    ############################################
+    # Polarimetric Speckle Filter node
+    if speckleFilter:
+        posp = parse_node('Polarimetric-Speckle-Filter')
+        workflow.insert_node(posp, before=last.id)
+        posp.parameters['filter'] = 'Box Car Filter'
+        posp.parameters['filterSize'] = 7
+        last = posp
+    ############################################
+    # Multilook node configuration
+    if multilook:
+        bands=None
+        ml = mli_parametrize(scene=id, spacing=spacing, rlks=rlks, azlks=azlks, sourceBands=bands)
+        if ml is not None:
+            workflow.insert_node(ml, before=last.id)
+            last = ml
+    ############################################
+    # merge bands to pass them to Terrain-Correction
+    bm_tc = None
+    bands = ['C11', 'C12_real', 'C12_imag', 'C22']
+    
+    ############################################
+    # configuration of node sequence for specific geocoding approaches
+    tc = geo_parametrize(spacing=spacing, t_srs=t_srs,
+                         tc_method=geocoding_type, sourceBands=bands,
+                         alignToStandardGrid=alignToStandardGrid,
+                         standardGridOriginX=standardGridOriginX,
+                         standardGridOriginY=standardGridOriginY)
+    workflow.insert_node(tc, before=last.id)
+    if isinstance(tc, list):
+        last = tc = tc[-1]
+    else:
+        last = tc
+        
+    ############################################
+    # parametrize write node
+    # create a suffix for the output file to identify processing steps performed in the workflow
+    suffix = workflow.suffix()
+    if tmpdir is None:
+        tmpdir = outdir
+    basename = os.path.join(tmpdir, id.outname_base(basename_extensions))
+    outname = basename + '_' + suffix
+    
+    write = parse_node('Write')
+    workflow.insert_node(write, before=last.id)
+    write.parameters['file'] = outname
+    write.parameters['formatName'] = 'ENVI'
+    
+    
+    if export_extra is not None:
+        tc_options = ['incidenceAngleFromEllipsoid',
+                      'localIncidenceAngle',
+                      'projectedLocalIncidenceAngle',
+                      'DEM',
+                      'layoverShadowMask']
+        tc_selection = []
+        for item in export_extra:
+            if item in tc_options:
+                key = 'save{}{}'.format(item[0].upper(), item[1:])
+                tc.parameters[key] = True
+                if item == 'DEM':
+                    tc_selection.append('elevation')
+                else:
+                    tc_selection.append(item)
+
+            else:
+                raise RuntimeError("ID '{}' not valid for argument 'export_extra'".format(item))
+    
+    ############################################
+    ############################################
+    # DEM handling
+    dem_parametrize(workflow=workflow, demName=demName,
+                    externalDEMFile=externalDEMFile,
+                    externalDEMNoDataValue=externalDEMNoDataValue,
+                    externalDEMApplyEGM=externalDEMApplyEGM)
+    ############################################
+    ############################################
+    # configure the resampling methods
+    
+    options_img = ['NEAREST_NEIGHBOUR',
+                   'BILINEAR_INTERPOLATION',
+                   'CUBIC_CONVOLUTION',
+                   'BISINC_5_POINT_INTERPOLATION',
+                   'BISINC_11_POINT_INTERPOLATION',
+                   'BISINC_21_POINT_INTERPOLATION',
+                   'BICUBIC_INTERPOLATION']
+    options_dem = options_img + ['DELAUNAY_INTERPOLATION']
+    
+    message = '{0} must be one of the following:\n- {1}'
+    if demResamplingMethod not in options_dem:
+        raise ValueError(message.format('demResamplingMethod', '\n- '.join(options_dem)))
+    if imgResamplingMethod not in options_img:
+        raise ValueError(message.format('imgResamplingMethod', '\n- '.join(options_img)))
+    
+    workflow.set_par('demResamplingMethod', demResamplingMethod)
+    workflow.set_par('imgResamplingMethod', imgResamplingMethod,
+                     exceptions=resampling_exceptions)
+    ############################################
+    ############################################
+    # additional parameter settings applied to the whole workflow
+    workflow.set_par('nodataValueAtSea', nodataValueAtSea)
+    ############################################
+    ############################################
+    # write workflow to file and optionally execute it
+    
+    log.debug('writing workflow to file')
+    
+    wf_name = outname.replace(tmpdir, outdir) + '_proc.xml'
+    workflow.write(wf_name)
+    
+    # execute the newly written workflow
+    if not test:
+        try:
+            groups = groupbyWorkers(wf_name, groupsize)
+            gpt(wf_name, groups=groups, cleanup=cleanup, tmpdir=outname,
+                gpt_exceptions=gpt_exceptions, gpt_args=gpt_args,
+                removeS1BorderNoiseMethod='pyroSAR')
+            writer(xmlfile=wf_name, outdir=outdir, basename_extensions=basename_extensions,
+                   clean_edges=clean_edges, clean_edges_npixels=clean_edges_npixels)
+        except Exception as e:
+            log.info(str(e))
+            with open(wf_name.replace('_proc.xml', '_error.log'), 'w') as logfile:
+                logfile.write(str(e))
+        finally:
+            if cleanup and os.path.isdir(outname):
+                log.info('deleting temporary files')
+                shutil.rmtree(outname, onerror=windows_fileprefix)
+        log.info('done')
+    if returnWF:
+        return wf_name
+    
+
+
+
+
+def coherence_geocode(infile, infile2, outdir, t_srs=4326, spacing=20, polarizations='all', shapefile=None, swaths = 'all', 
+                      enhancedSpectralDiv= False, multilooking = False, geocoding_type='Range-Doppler', offset=None, allow_RES_OSV=False, 
+                      demName='Copernicus 30m Global DEM', externalDEMFile=None, externalDEMNoDataValue=None, externalDEMApplyEGM=True,
+                      test=False, groupsize=1, cleanup=True, tmpdir=None, gpt_exceptions=None, gpt_args=None, returnWF=False, 
+                      nodataValueAtSea=False, demResamplingMethod='BILINEAR_INTERPOLATION', imgResamplingMethod='BILINEAR_INTERPOLATION',
+                      cohresamplingtype='BISINC_5_POINT_INTERPOLATION', alignToStandardGrid=False, standardGridOriginX=0,
+                      standardGridOriginY=0, rlks=None, azlks=None):
+    
+    """
+    general function for S1 interferometric coherence computation and geocoding using snap and pyrosar.
+    
+    This function performs the following steps:
+    
+    - identify the SAR scene(s) passed via argument `infile` (:func:`pyroSAR.drivers.identify`)
+    - (if necessary) download Sentinel-1 OSV files
+    - parse a SNAP workflow
+    - write the workflow to an XML file in `outdir`
+    - execute the workflow
+
+    Parameters
+    ----------
+    infile: str or ~pyroSAR.drivers.ID or list
+        The reference (master) SAR scene(s) ; multiple scenes are treated as consecutive acquisitions, which will be
+        mosaicked with SNAP's SliceAssembly operator.
+        
+    infile2: str or ~pyroSAR.drivers.ID or list
+        The secondary (slave) SAR scene(s) ; multiple scenes are treated as consecutive acquisitions, which will be
+        mosaicked with SNAP's SliceAssembly operator. These scenes must follow the same relative orbit and cover the same geographical area as infile.
+
+    outdir: str
+        The directory to write the final files to.
+        
+    
+    t_srs: int, str or osr.SpatialReference
+        A target geographic reference system in WKT, EPSG, PROJ4 or OPENGIS format.
+        See function :func:`spatialist.auxil.crsConvert()` for details.
+        Default: `4326 <https://spatialreference.org/ref/epsg/4326/>`_.
+        
+    spacing: int or float, optional
+        The target pixel spacing in meters after geocoding. Default is 25
+        
+    polarizations: list[str] or str
+        The polarizations to be processed; can be a string for a single polarization, e.g. 'VV', or a list of several
+        polarizations, e.g. ['VV', 'VH']. With the special value 'all' (default) all available polarizations are
+        processed.
+        
+    swaths : list[str] or str
+        The swaths to process
+        
+    enhancedSpectralDiv: bool
+        Apply the enhanced spectral divergence operation? It improves the coregistration of the points when more than 1 burst is treated.
+        For now, only the default options are supported. Default is False.
+        
+    multilooking: bool
+        Apply a multilooking step to the coherence before geocoding it? Default is False
+    
+    shapefile: str or :py:class:`~spatialist.vector.Vector` or dict, optional
+        A vector geometry for subsetting the SAR scene to a test site. Default is None.
+        
+    geocoding_type: {'Range-Doppler', 'SAR simulation cross correlation'}, optional
+        The type of geocoding applied; can be either 'Range-Doppler' (default) or 'SAR simulation cross correlation'
+        
+    offset: tuple, optional
+        A tuple defining offsets for left, right, top and bottom in pixels, e.g. (100, 100, 0, 0); this variable is
+        overridden if a shapefile is defined. Default is None.
+        
+    allow_RES_OSV: bool
+        (only applies to Sentinel-1) Also allow the less accurate RES orbit files to be used?
+        The function first tries to download a POE file for the scene.
+        If this fails and RES files are allowed, it will download the RES file.
+        The selected OSV type is written to the workflow XML file.
+        Processing is aborted if the correction fails (Apply-Orbit-File parameter continueOnFail set to false).
+        
+    demName: str
+        The name of the auto-download DEM. Default is 'SRTM 1Sec HGT'. Is ignored when `externalDEMFile` is not None.
+        Supported options:
+         - ACE2_5Min
+         - ACE30
+         - ASTER 1sec GDEM
+         - CDEM
+         - Copernicus 30m Global DEM
+         - Copernicus 90m Global DEM
+         - GETASSE30
+         - SRTM 1Sec Grid
+         - SRTM 1Sec HGT
+         - SRTM 3Sec
+         
+    externalDEMFile: str or None, optional
+        The absolute path to an external DEM file. Default is None. Overrides `demName`.
+        
+    externalDEMNoDataValue: int, float or None, optional
+        The no data value of the external DEM. If not specified (default) the function will try to read it from the
+        specified external DEM.
+        
+    externalDEMApplyEGM: bool, optional
+        Apply Earth Gravitational Model to external DEM? Default is True.
+        
+    test: bool, optional
+        If set to True the workflow xml file is only written and not executed. Default is False.
+        
+    groupsize: int
+        The number of workers executed together in one gpt call.
+        
+    cleanup: bool
+        Should all files written to the temporary directory during function execution be deleted after processing?
+        Default is True.
+        
+    tmpdir: str or None
+        Path of custom temporary directory, useful to separate output folder and temp folder. If `None`, the `outdir`
+        location will be used. The created subdirectory will be deleted after processing if ``cleanup=True``.
+        
+    gpt_exceptions: dict or None
+        A dictionary to override the configured GPT executable for certain operators;
+        each (sub-)workflow containing this operator will be executed with the define executable;
+        
+    gpt_args: list or None
+        A list of additional arguments to be passed to the gpt call.
+        
+    returnWF: bool
+        Return the full name of the written workflow XML file?
+        
+    nodataValueAtSea: bool
+        Mask pixels acquired over sea? The sea mask depends on the selected DEM.
+        
+    demResamplingMethod: str
+        One of the following:
+         - 'NEAREST_NEIGHBOUR'
+         - 'BILINEAR_INTERPOLATION'
+         - 'CUBIC_CONVOLUTION'
+         - 'BISINC_5_POINT_INTERPOLATION'
+         - 'BISINC_11_POINT_INTERPOLATION'
+         - 'BISINC_21_POINT_INTERPOLATION'
+         - 'BICUBIC_INTERPOLATION'
+         
+    imgResamplingMethod: str
+        The resampling method for geocoding the SAR image; the options are identical to demResamplingMethod.
+
+    cohresamplingtype : str
+        The resampling method for the back-geocoding, the options are identical to the two previous resamplings. 
+        
+    alignToStandardGrid: bool
+        Align all processed images to a common grid?
+        
+    standardGridOriginX: int or float
+        The x origin value for grid alignment
+        
+    standardGridOriginY: int or float
+        The y origin value for grid alignment
+        
+    rlks: int or None
+        the number of range looks. If not None, overrides the computation done by function
+        :func:`pyroSAR.ancillary.multilook_factors` based on the image pixel spacing and the target spacing.
+        
+    azlks: int or None
+        the number of azimuth looks. Like `rlks`.
+    
+    Returns
+    -------
+    str or None
+        Either the name of the workflow file if ``returnWF == True`` or None otherwise    
+    """
+
+    if isinstance(infile, ID):
+        id = infile
+        ids = [id]
+    elif isinstance(infile, str):
+        id = identify(infile)
+        ids = [id]
+    elif isinstance(infile, list):
+        ids = identify_many(infile, sortkey='start')
+        id = ids[0]
+    else:
+        raise TypeError("'infile' must be of type str, list or pyroSAR.ID")
+
+        
+    if isinstance(infile2, ID):
+        id2 = infile2
+        ids2 = [id2]
+    elif isinstance(infile2, str):
+        id2 = identify(infile2)
+        ids2 = [id2]
+    elif isinstance(infile2, list):
+        ids2 = identify_many(infile2, sortkey='start')
+        id2 = ids2[0]
+    else:
+        raise TypeError("'infile2' must be of type str, list or pyroSAR.ID")
+
+    if ids[0].orbitNumber_rel !=ids2[0].orbitNumber_rel:
+        raise RuntimeError("The two scenes must have the same relative orbit")
+    
+    if id.is_processed(outdir):
+        log.info('scene {} already processed'.format(id.outname_base()))
+        return
+    
+    if not os.path.isdir(outdir):
+        os.makedirs(outdir)
+    ############################################
+    # general setup    
+    formatName = 'SENTINEL-1'
+    
+    # several options like resampling are modified globally for the whole workflow at the end of this function
+    # this list gathers IDs of nodes for which this should not be done because they are configured individually
+    resampling_exceptions = []
+    ######################
+    if isinstance(polarizations, str):
+        if polarizations == 'all':
+            polarizations = id.polarizations
+        else:
+            if polarizations in id.polarizations:
+                polarizations = [polarizations]
+            else:
+                raise RuntimeError('polarization {} does not exists in the source product'.format(polarizations))
+    elif isinstance(polarizations, list):
+        polarizations = [x for x in polarizations if x in id.polarizations]
+    else:
+        raise RuntimeError('polarizations must be of type str or list')
+    
+
+    ############################################
+    ############################################
+    # parse base workflow
+    workflow = parse_recipe('blank')
+    ############################################
+    if not isinstance(infile, list):
+        infile = [infile]
+    if not isinstance(infile2, list):
+        infile2 = [infile2]
+        
+    if isinstance(swaths, str):
+        if swaths=='all':
+            swaths=['IW1','IW2','IW3']
+        elif swaths in ['IW1', 'IW2', 'IW3']:
+            swaths= [swaths]
+        else:
+            raise ValueError('swaths must be a string containing all, IW1, IW2 or IW3, or a list')
+            
+    elif isinstance(swaths, list):
+        for item in swaths:
+            if item not in ['IW1', 'IW2','IW3']:
+                raise ValueError('unsupported value for swaths: {}'.format(item))
+    else:
+        raise TypeError("'swaths' must be of type str, or list of str")
+
+    
+    last = None
+    collectmerge=[]
+    for aswath in swaths:
+
+        collect=[]
+        for i in range(0, len(infile)):
+            ############################################
+            # Read node configuration
+            read = parse_node('Read')
+            workflow.insert_node(read)
+            read.parameters['file'] = ids[i].scene
+            read.parameters['formatName'] = formatName
+            last = read
+            ############################################
+            # Apply-Orbit-File node configuration
+            orb = orb_parametrize(scene=ids[i], formatName=formatName, allow_RES_OSV=allow_RES_OSV)
+            workflow.insert_node(orb, before=last.id)
+            last = orb
+            collect.append(last.id)
+        ############################################
+        # SliceAssembly node configuration
+        if len(collect) > 1:
+            sliceAssembly = parse_node('SliceAssembly')
+            workflow.insert_node(sliceAssembly, before=collect)
+            sliceAssembly.parameters['selectedPolarisations'] = polarizations
+            last = sliceAssembly
+        ############################################
+        # Split node configuration
+        split = parse_node('TOPSAR-Split')
+        workflow.insert_node(split, before = last.id)
+        split.parameters['subswath']=aswath        
+        split.parameters['selectedPolarisations']= polarizations
+        last1 = split
+
+        collect2=[]
+        for j in range(0, len(infile2)):
+            ############################################
+            # Read node configuration
+            read = parse_node('Read')
+            workflow.insert_node(read)
+            read.parameters['file'] = ids2[j].scene
+            read.parameters['formatName'] = formatName
+            last = read
+            ############################################
+            # Apply-Orbit-File node configuration
+            orb2 = orb_parametrize(scene=ids2[j], formatName=formatName, allow_RES_OSV=allow_RES_OSV)
+            workflow.insert_node(orb2, before=last.id)
+            last = orb2
+            collect2.append(last.id)
+        ############################################
+        # SliceAssembly node configuration
+        if len(collect) > 1:
+            sliceAssembly = parse_node('SliceAssembly')
+            workflow.insert_node(sliceAssembly, before=collect2)
+            sliceAssembly.parameters['selectedPolarisations'] = polarizations
+            last = sliceAssembly
+        ############################################
+        # Split node configuration
+        split2 = parse_node('TOPSAR-Split')
+        workflow.insert_node(split2, before = last.id)
+        split2.parameters['subswath']=aswath        
+        split2.parameters['selectedPolarisations']= polarizations
+        last2 = split2
+
+        ############################################
+        #Back geocoding node configuration
+        coreg = parse_node('Back-Geocoding')
+        workflow.insert_node(coreg, before=[last1.id,last2.id])
+        if nodataValueAtSea:
+            coreg.parameters['maskOutAreaWithoutElevation']=True
+        else:
+            coreg.parameters['maskOutAreaWithoutElevation']=False
+        last = coreg
+        ############################################
+        #Enhanced spectral diversity node configuration
+        if enhancedSpectralDiv:
+            enhance = parse_node('Enhanced-Spectral-Diversity')
+            workflow.insert_node(enhance, before = last.id)
+            last = enhance
+                    
+        ############################################    
+        #Coherence from interferometry
+        coherence = parse_node('Coherence')
+        workflow.insert_node(coherence, before=last.id)
+        coherence.parameters['subtractFlatEarthPhase']=True
+        coherence.parameters['subtractTopographicPhase']=True
+        coherence.parameters['singleMaster']=True
+        coherence.parameters['squarePixel']=True
+        coherence.parameters['cohWinRg']=10
+        last = coherence
+        ###########################################
+        # TOPSAR-Deburst node configuration
+        deb = parse_node('TOPSAR-Deburst')
+        workflow.insert_node(deb, before=last.id)
+        deb.parameters['selectedPolarisations'] = polarizations
+        last = deb
+        collectmerge.append(last.id)
+                    
+        
+    ###########################################       
+    #Merge step here
+    if len(collectmerge)>1:
+        merge = parse_node('TOPSAR-Merge')
+        workflow.insert_node(merge, before = collectmerge) 
+        last = merge
+    ############################################
+    # Subset node configuration
+    if shapefile is not None or offset is not None:
+        sub = sub_parametrize(scene=id, geometry=shapefile, offset=offset, buffer=0.)
+        workflow.insert_node(sub, before=last.id)
+        last = sub
+    ############################################
+    # Multilook node configuration
+    if multilooking:
+        ml = mli_parametrize(scene=ids[0], spacing=spacing, rlks=rlks, azlks=azlks, sourceBands=None)
+        if ml is not None:
+            workflow.insert_node(ml, before=last.id)
+            last = ml    
+    
+    ############################################
+    # configuration of node sequence for specific geocoding approaches
+    tc = geo_parametrize(spacing=spacing, t_srs=t_srs,
+                         tc_method=geocoding_type, sourceBands=None,
+                         alignToStandardGrid=alignToStandardGrid,
+                         standardGridOriginX=standardGridOriginX,
+                         standardGridOriginY=standardGridOriginY)
+    workflow.insert_node(tc, before=last.id)
+    if isinstance(tc, list):
+        last = tc = tc[-1]
+    else:
+        last = tc
+    ############################################
+    # parametrize write node
+    # create a suffix for the output file to identify processing steps performed in the workflow
+    suffix = workflow.suffix()
+    if tmpdir is None:
+        tmpdir = outdir
+    basename = os.path.join(tmpdir, id.outname_base())
+    outname = basename + '_' + suffix
+    
+    write = parse_node('Write')
+    workflow.insert_node(write, before=last.id)
+    write.parameters['file'] = outname
+    write.parameters['formatName'] = 'ENVI'
+    ############################################
+    ############################################
+    # DEM handling
+    
+    dem_parametrize(workflow=workflow, demName=demName,
+                    externalDEMFile=externalDEMFile,
+                    externalDEMNoDataValue=externalDEMNoDataValue,
+                    externalDEMApplyEGM=externalDEMApplyEGM)
+    
+    ############################################
+    ############################################
+    # configure the resampling methods
+    options_img = ['NEAREST_NEIGHBOUR',
+                   'BILINEAR_INTERPOLATION',
+                   'CUBIC_CONVOLUTION',
+                   'BISINC_5_POINT_INTERPOLATION',
+                   'BISINC_11_POINT_INTERPOLATION',
+                   'BISINC_21_POINT_INTERPOLATION',
+                   'BICUBIC_INTERPOLATION']
+    options_dem = options_img + ['DELAUNAY_INTERPOLATION']
+    
+    message = '{0} must be one of the following:\n- {1}'
+    if demResamplingMethod not in options_dem:
+        raise ValueError(message.format('demResamplingMethod', '\n- '.join(options_dem)))
+    if imgResamplingMethod not in options_img:
+        raise ValueError(message.format('imgResamplingMethod', '\n- '.join(options_img)))
+    
+    workflow.set_par('demResamplingMethod', demResamplingMethod)
+    workflow.set_par('imgResamplingMethod', imgResamplingMethod,
+                     exceptions=resampling_exceptions)
+    workflow.set_par('resamplingType',cohresamplingtype)
+    ############################################
+    ############################################
+    # additional parameter settings applied to the whole workflow
+    workflow.set_par('nodataValueAtSea', nodataValueAtSea)
+    ############################################
+    ############################################
+    # write workflow to file and optionally execute it
+    log.debug('writing workflow to file')
+    
+    wf_name = outname.replace(tmpdir, outdir) + '_proc.xml'
+    workflow.write(wf_name)
+    
+    # execute the newly written workflow
+    if not test:
+        try:
+            groups = groupbyWorkers(wf_name, groupsize)
+            gpt(wf_name, groups=groups, cleanup=cleanup, tmpdir=outname,
+                gpt_exceptions=gpt_exceptions, gpt_args=gpt_args)
+            writer(xmlfile=wf_name, outdir=outdir)
+        except Exception as e:
+            log.info(str(e))
+            with open(wf_name.replace('_proc.xml', '_error.log'), 'w') as logfile:
+                logfile.write(str(e))
+        finally:
+            if cleanup and os.path.isdir(outname):
+                log.info('deleting temporary files')
+                shutil.rmtree(outname, onerror=windows_fileprefix)
+        log.info('done')
+    if returnWF:
+        return wf_name
